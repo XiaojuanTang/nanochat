@@ -178,6 +178,7 @@ python -m pytest tests/test_rustbpe.py -v -s
 │   ├── arc.py                      # Multiple choice science questions
 │   ├── common.py                   # TaskMixture | TaskSequence
 │   ├── customjson.py               # Make Task from arbitrary jsonl convos
+│   ├── aime_24_25.py               # AIME 2024/2025 math exam tasks
 │   ├── gsm8k.py                    # 8K Grade School Math questions
 │   ├── humaneval.py                # Misnomer; Simple Python coding task
 │   ├── mmlu.py                     # Multiple choice questions, broad topics
