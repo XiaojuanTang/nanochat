@@ -8,7 +8,7 @@
 - 配置入口：`nanochat/gpt.py` 的 `GPTConfig` 新增 `mlp_type`（默认 `relu2`，可选 `swiglu`）。
 - MLP 分支（位于 `nanochat/gpt.py` 的 `MLP` 类）：
   - `relu2`：保持原 4× 扩张，全连接 → `relu().square()` → `c_proj`。
-  - `swiglu`：双线性层 `w_gate`、`w_up`，隐藏维度取 $\text{hidden\_dim} = \frac{8}{3} \cdot n\_\text{embd}$，计算 $\text{silu}( \text{gate} ) \times \text{up}$ 后接 `c_proj`。该取值使参数量与 4× relu² MLP 持平，约为 $8 \times n\_\text{embd}^2$ 个权重。
+  - `swiglu`：双线性层 `w_gate`、`w_up`，隐藏维度取 \(\text{hidden\_dim} = \frac{8}{3} \cdot n\_\text{embd}\)，计算 \(\text{silu}(\text{gate}) \times \text{up}\) 后接 `c_proj`。该取值使参数量与 4× relu² MLP 持平，约为 \(8 \times n\_\text{embd}^2\) 个权重。
 - 使用方式：`scripts/base_train.py` 暴露 `--mlp_type` 并传入 `GPTConfig`，命令行即可切换基线/变体。
 
 - 运行命令是
