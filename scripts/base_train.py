@@ -11,6 +11,9 @@ If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Ex
 python -m scripts.base_train --depth=4 --max_seq_len=512 --device_batch_size=1 --eval_tokens=512 --core_metric_every=-1 --total_batch_size=512 --num_iterations=20
 """
 
+import setproctitle
+
+setproctitle.setproctitle("python")
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import time
@@ -37,6 +40,7 @@ device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, i
 # Model architecture
 depth = 20 # the depth of the Transformer model to train, rest of the kwargs are derived
 max_seq_len = 2048 # max context length
+mlp_type = "relu2" # relu2 | swiglu
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
@@ -121,6 +125,7 @@ model_config_kwargs = dict(
     n_embd=model_dim,
     gradient_checkpointing=use_gradient_checkpointing,
     use_liger_kernels=use_liger_kernels,
+    mlp_type=mlp_type,
 )
 with torch.device("meta"):
     model_config = GPTConfig(**model_config_kwargs)

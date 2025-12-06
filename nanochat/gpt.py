@@ -5,6 +5,7 @@ Notable features:
 - QK norm
 - untied weights for token embedding and lm_head
 - relu^2 activation in MLP
+- optional SwiGLU MLP (parameter matched to relu^2)
 - norm after token embedding
 - no learnable params in rmsnorm
 - no bias in linear layers
@@ -43,6 +44,7 @@ class GPTConfig:
     n_embd: int = 768
     gradient_checkpointing: bool = False
     use_liger_kernels: bool = False
+    mlp_type: str = "relu2" # relu2 | swiglu
 
 
 def norm(x):
@@ -125,12 +127,29 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.mlp_type = getattr(config, "mlp_type", "relu2")
+        assert self.mlp_type in {"relu2", "swiglu"}, f"Unsupported mlp_type: {self.mlp_type}"
+
+        if self.mlp_type == "swiglu":
+            # Hidden dim chosen so parameter count matches the relu^2 MLP: 3 * n_embd * hidden ~= 8 * n_embd^2
+            hidden_dim = int(8 * config.n_embd / 3)
+            self.w_gate = nn.Linear(config.n_embd, hidden_dim, bias=False)
+            self.w_up = nn.Linear(config.n_embd, hidden_dim, bias=False)
+            self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+        else:
+            hidden_dim = 4 * config.n_embd
+            self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
+            self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+        self.hidden_dim = hidden_dim
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
+        if self.mlp_type == "swiglu":
+            gate = self.w_gate(x)
+            up = self.w_up(x)
+            x = F.silu(gate) * up
+        else:
+            x = self.c_fc(x)
+            x = F.relu(x).square()
         x = self.c_proj(x)
         return x
 
