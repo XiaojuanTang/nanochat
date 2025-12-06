@@ -50,6 +50,8 @@ embedding_lr = 0.2
 matrix_lr = 0.02
 weight_decay = 0.0
 init_lr_frac = 0.02
+use_gradient_checkpointing = False
+use_liger_kernels = False
 # evaluation and logging there of
 eval_every = 100
 eval_steps = 100
@@ -74,6 +76,8 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sf
 
 # Load the model and tokenizer
 model, tokenizer, meta = load_model(source, device, phase="train", model_tag=model_tag, step=step)
+model.config.gradient_checkpointing = bool(use_gradient_checkpointing)
+model.config.use_liger_kernels = bool(use_liger_kernels)
 orig_model = model # original, uncompiled model
 # model = torch.compile(model, dynamic=True) # doesn't work super well because of variable lengths of inputs
 engine = Engine(model, tokenizer) # will be used for inline model evaluation only

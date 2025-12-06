@@ -10,6 +10,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.mid_train -- --device_batch_
 """
 
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import time
@@ -48,6 +49,11 @@ eval_every = 150 # -1 = disable
 eval_tokens = 20*524288
 total_batch_size = 524288
 dry_run = 0 # dry_run=1 is for experiments: we will log to wandb but we won't write checkpoints or report
+use_gradient_checkpointing = 0 # set to 1 to enable gradient checkpointing during midtraining
+use_liger_kernels = 0 # set to 1 to enable Liger fused CE (optional dependency)
+# tokenizer/data loading knobs: default 0 keeps original (single-threaded) behavior
+tokenizer_batch_size = 32  # how many conversations to tokenize together when filling the token buffer
+tokenizer_num_workers = 0  # >0 enables threaded batch tokenization in mid_data_generator
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
 user_config = {k: globals()[k] for k in config_keys} # possibly useful for logging
@@ -70,6 +76,10 @@ model, tokenizer, meta = load_model("base", device, phase="train", model_tag=mod
 pretrain_batch_size = meta.get("device_batch_size", None)
 if pretrain_batch_size is not None and device_batch_size > pretrain_batch_size:
     print0(f"FOOTGUN WARNING: base model training used device_batch_size {pretrain_batch_size}, did you pass in a good --device_batch_size to this script?")
+    # Enable gradient checkpointing if requested. This flag is not saved in the
+    # base checkpoint, so we toggle it on the config here before compilation.
+model.config.gradient_checkpointing = bool(use_gradient_checkpointing)
+model.config.use_liger_kernels = bool(use_liger_kernels)
 orig_model = model
 model = torch.compile(model, dynamic=False)
 depth = model.config.n_layer
@@ -126,17 +136,40 @@ def mid_data_generator(split):
     scratch = torch.empty(needed_tokens, dtype=torch.int64, pin_memory=(device_type == "cuda"))
     cursor = ddp_rank # increments by ddp_world_size each time, so each rank processes unique documents
     it = 0 # iteration counter
+    # Optional threaded batch tokenization: when tokenizer_num_workers > 0，我们会把多条 conversation
+    # 组成一个小 batch，用 ThreadPoolExecutor 并行调用 tokenizer.render_conversation，减少单条调用的开销。
+    executor = ThreadPoolExecutor(max_workers=tokenizer_num_workers) if tokenizer_num_workers > 0 else None
     while True:
         # Accumulate enough tokens for one iteration before yielding
         while len(token_buffer) < needed_tokens:
-            conversation = dataset[cursor]
-            ids, _ = tokenizer.render_conversation(conversation)
-            token_buffer.extend(ids)
-            cursor += ddp_world_size
-            if cursor >= dataset_size:
-                cursor -= dataset_size # wrap around for another epoch
-                if split == "train":
-                    last_step = True # toggle last_step to True, which will terminate the training loop
+            # 原始实现是逐条 conversation 调用 render_conversation；
+            # 这里在有 worker 时，会一次取 tokenizer_batch_size 条样本做“批量 tokenize”。
+            if executor is None or tokenizer_batch_size <= 1:
+                conversation = dataset[cursor]
+                ids, _ = tokenizer.render_conversation(conversation)
+                token_buffer.extend(ids)
+                cursor += ddp_world_size
+                if cursor >= dataset_size:
+                    cursor -= dataset_size # wrap around for another epoch
+                    if split == "train":
+                        last_step = True # toggle last_step to True, which will terminate the training loop
+            else:
+                batch_docs = []
+                # 收集一小批 conversation，注意仍然按 DDP rank 步长遍历
+                while len(batch_docs) < tokenizer_batch_size:
+                    conversation = dataset[cursor]
+                    batch_docs.append(conversation)
+                    cursor += ddp_world_size
+                    if cursor >= dataset_size:
+                        cursor -= dataset_size
+                        if split == "train":
+                            last_step = True
+                    # 如果已经绕完一圈数据集并且需要停止训练，就不再强行补满 batch
+                    if last_step:
+                        break
+                # 在线程池中并行调用 tokenizer.render_conversation
+                for ids, _ in executor.map(tokenizer.render_conversation, batch_docs):
+                    token_buffer.extend(ids)
         # Stopping condition to respect num_iterations, if given
         it += 1
         if num_iterations > 0 and it >= num_iterations:
@@ -224,6 +257,8 @@ while True:
                     "n_head": model.config.n_head,
                     "n_kv_head": model.config.n_kv_head,
                     "n_embd": model.config.n_embd,
+                    "gradient_checkpointing": bool(model.config.gradient_checkpointing),
+                    "use_liger_kernels": bool(getattr(model.config, "use_liger_kernels", False)),
                 },
                 "user_config": user_config, # inputs to the training script
             }

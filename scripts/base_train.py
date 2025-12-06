@@ -53,6 +53,8 @@ warmup_ratio = 0.0 # ratio of iterations for LR warmup
 warmdown_ratio = 0.2 # ratio of iterations for LR warmdown
 final_lr_frac = 0.0 # final LR is this fraction of the initial LR
 resume_from_step = -1 # resume training from this step of the optimization (-1 = disable)
+use_gradient_checkpointing = False # use gradient checkpointing to save memory
+use_liger_kernels = False # use Liger fused linear+cross-entropy (requires liger-kernel)
 # Evaluation
 eval_every = 250 # every how many steps to evaluate the model for val bpb
 eval_tokens = 20*524288 # number of tokens to evaluate val loss on
@@ -110,7 +112,16 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 # Initialize the Model
 
 # Create a new model with random weights
-model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
+model_config_kwargs = dict(
+    sequence_len=max_seq_len,
+    vocab_size=vocab_size,
+    n_layer=num_layers,
+    n_head=num_heads,
+    n_kv_head=num_kv_heads,
+    n_embd=model_dim,
+    gradient_checkpointing=use_gradient_checkpointing,
+    use_liger_kernels=use_liger_kernels,
+)
 with torch.device("meta"):
     model_config = GPTConfig(**model_config_kwargs)
     model = GPT(model_config)

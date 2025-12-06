@@ -18,11 +18,21 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as cp
 
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
 
+try:
+    from liger_kernel.transformers.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
+    # from liger_kernel.transformers.rms_norm import LigerRMSNorm
+    _HAS_LIGER = True
+except Exception:
+    LigerFusedLinearCrossEntropyLoss = None
+    # LigerRMSNorm = None
+    _HAS_LIGER = False
+    
 @dataclass
 class GPTConfig:
     sequence_len: int = 1024
@@ -31,6 +41,8 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
+    gradient_checkpointing: bool = False
+    use_liger_kernels: bool = False
 
 
 def norm(x):
@@ -144,6 +156,18 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        
+        self.use_liger_ce = False
+        
+        if getattr(config, "use_liger_kernels", False):
+            if not _HAS_LIGER:
+                print0("Liger kernels requested but not installed; falling back to torch cross entropy.")
+                
+            else:
+                self.use_liger_ce = True
+            
+        self._liger_ce = None # lazy init
+        
         # To support meta device initialization, we init the rotary embeddings here, but it's fake
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them, but assert fail if we ever reach that amount.
@@ -255,15 +279,44 @@ class GPT(nn.Module):
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx)
         x = norm(x)
+        
+        config_ckpt = getattr(self.config, "gradient_checkpointing", False)
+        if config_ckpt and kv_cache is not None:
+            print0("`use_cache=True` is incompatible with gradient checkpointing. Setting `kv_cache=None`.")
+            
+        use_ckpt = config_ckpt and kv_cache is None
+        
         for block in self.transformer.h:
-            x = block(x, cos_sin, kv_cache)
+            if use_ckpt:
+                def checkpointed_block(hidden, block=block):
+                    return block(hidden, cos_sin, None) # kv_cache is None inside checkpointed block
+                x = cp.checkpoint(checkpointed_block, x, use_reentrant=False)
+            else:
+                x = block(x, cos_sin, kv_cache)
         x = norm(x)
 
         # Forward the lm_head (compute logits)
         softcap = 15
+        
         if targets is not None:
             # training mode: compute and return the loss
             # TODO: experiment with Liger Kernels / chunked cross-entropy etc.
+            if self.use_liger_ce:
+                if self._liger_ce is None:
+                    self._liger_ce = LigerFusedLinearCrossEntropyLoss(
+                        ignore_index=-1,
+                        reduction='mean',
+                        softcap=softcap,
+                        accum_dtype=torch.float32,
+                    )
+                x_flat = x.reshape(-1, x.size(-1))
+                target_flat = targets.view(-1)
+                loss = self._liger_ce(self.lm_head.weight, x_flat, target_flat)
+                # loss = loss_out if isinstance(loss_out, torch.Tensor) else loss_out.loss
+                
+               
+                return loss
+            
             logits = self.lm_head(x)
             logits = softcap * torch.tanh(logits / softcap) # logits softcap
             logits = logits.float() # use tf32/fp32 for logits
