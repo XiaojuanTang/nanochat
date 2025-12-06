@@ -46,9 +46,9 @@ torch.compile 通过即时编译 (JIT) 技术，对 PyTorch 模型的前向和�
 - 测试：在 base/mid/SFT 分别跑少量迭代（如 `--num_iterations=20`），观察 loss 下降、无 NaN/OOM。
 - 显存验证：开启/关闭开关对比 `nvidia-smi` 或 `torch.cuda.max_memory_allocated` 峰值，确认激活占用下降；同时关注 `dt` 变长是预期的重算开销。
   - 重计算前：
-    ![alt text](image-1.png)
+    ![alt text](image/README_PERF/image-1.png)
     重计算后：
-    ![alt text](image.png)
+    ![alt text](image/README_PERF/image.png)
     二者在dt的时间对比，红色是重计算后，dt时间变多了
     ![1765029196958](image/README_PERF/1765029196958.png)
 
