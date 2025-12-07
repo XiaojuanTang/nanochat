@@ -12,6 +12,7 @@ The whole thing is made as efficient as possible.
 """
 
 import torch
+import time
 import torch.nn.functional as F
 import signal
 import warnings
@@ -20,7 +21,7 @@ from collections import deque
 from nanochat.common import compute_init, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
 from contextlib import nullcontext 
-
+import logging
 # -----------------------------------------------------------------------------
 # Calculator tool helpers
 @contextmanager
@@ -122,7 +123,7 @@ class KVCache:
         dtype, device = other.kv_cache.dtype, other.kv_cache.device
         self.kv_cache = torch.empty(self.kv_shape, dtype=dtype, device=device)
         # 3) copy the data over
-        self.kv_cache[:, :, :, :, :other.pos, :] = other.kv_cache
+        self.kv_cache[:, :, :, :, :other.pos, :] = other.kv_cache[:, :, :, :, :other.pos, :]
         # 4) update the pos
         self.pos = other.pos
 
@@ -156,20 +157,44 @@ class KVCache:
 
 # -----------------------------------------------------------------------------
 @torch.inference_mode()
-def sample_next_token(logits, rng, temperature=1.0, top_k=None):
+def sample_next_token(logits, rng, temperature=1.0, top_k=None, top_p=None):
     """Sample a single next token from given logits of shape (B, vocab_size). Returns (B, 1)."""
+
     assert temperature >= 0.0, "temperature must be non-negative"
     if temperature == 0.0:
         return torch.argmax(logits, dim=-1, keepdim=True)
+
+    # Helper for nucleus (top-p) filtering on an already-temperature-scaled logits tensor
+    def apply_top_p_filtering(logits_in, top_p_value):
+        if top_p_value is None or not (0.0 < top_p_value < 1.0):
+            return logits_in
+        # Sort logits descending
+        sorted_logits, sorted_indices = torch.sort(logits_in, descending=True, dim=-1)
+        sorted_probs = F.softmax(sorted_logits, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        # Mask out tokens beyond the nucleus
+        sorted_indices_to_remove = cumulative_probs > top_p_value
+        # Ensure at least one token is kept
+        sorted_indices_to_remove[..., 0] = False
+        # Map the mask back to the original indices
+        indices_to_remove = torch.zeros_like(sorted_indices_to_remove, dtype=torch.bool)
+        indices_to_remove.scatter_(dim=-1, index=sorted_indices, src=sorted_indices_to_remove)
+        return logits_in.masked_fill(indices_to_remove, -float("Inf"))
+
     if top_k is not None:
+        # Top-k truncation (as before), optionally followed by top-p within that subset
         k = min(top_k, logits.size(-1))
         vals, idx = torch.topk(logits, k, dim=-1)
         vals = vals / temperature
+        # Optional top-p within the top-k set
+        vals = apply_top_p_filtering(vals, top_p)
         probs = F.softmax(vals, dim=-1)
         choice = torch.multinomial(probs, num_samples=1, generator=rng)
         return idx.gather(1, choice)
     else:
+        # Full-vocab sampling with optional top-p
         logits = logits / temperature
+        logits = apply_top_p_filtering(logits, top_p)
         probs = F.softmax(logits, dim=-1)
         return torch.multinomial(probs, num_samples=1, generator=rng)
 
@@ -186,17 +211,41 @@ class RowState:
 
 class Engine:
 
-    def __init__(self, model, tokenizer):
+    def __init__(self, model, tokenizer, draft_model=None, draft_tokenizer=None):
         self.model = model
-        self.tokenizer = tokenizer # needed for tool use
+        self.tokenizer = tokenizer  # needed for tool use
+        self.draft_model = draft_model
+        # Assume same tokenizer unless explicitly provided
+        self.draft_tokenizer = draft_tokenizer if draft_tokenizer is not None else tokenizer
+        self.verbose_speculative = False
 
     @torch.inference_mode()
-    def generate(self, tokens,  attention_mask=None, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
-        """Same as generate, but does single prefill and then clones the KV cache."""
-        # assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
+    def generate(self, tokens, attention_mask=None, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, top_p=None, seed=42, speculative_num_tokens=0, log_timing=False, timing_label="engine.generate"):
+        """
+        Streaming generation.
+        If a draft_model is present and speculative_num_tokens > 0, use speculative decoding;
+        otherwise fall back to standard autoregressive decoding.
+        """
+        if self.draft_model is not None and speculative_num_tokens > 0 and num_samples == 1:
+            print(f"Using speculative decoding with {speculative_num_tokens} speculative tokens. {log_timing}")
+            yield from self._generate_speculative(
+                tokens,
+                max_tokens,
+                temperature,
+                top_k,
+                top_p,
+                seed,
+                speculative_num_tokens,
+                log_timing=log_timing,
+                timing_label=timing_label,
+            )
+            return
+        
         # process one squence 
         if isinstance(tokens[0], int):
             tokens = [tokens]
+        start_time = time.time()
+        tokens_emitted = 0
         device = self.model.get_device()
         rng = torch.Generator(device=device)
         rng.manual_seed(seed)
@@ -225,7 +274,7 @@ class Engine:
             ids_attention_mask = None
         logits = self.model.forward(ids, attention_mask=ids_attention_mask, kv_cache=kv_cache_prefill)
         logits = logits[:, -1, :]
-        next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
+        next_ids = sample_next_token(logits, rng, temperature, top_k, top_p)  # (B, 1)
         sampled_tokens = next_ids[:, 0].tolist()
 
         # 2) Replicate the KV cache for each sample/row
@@ -245,74 +294,83 @@ class Engine:
         # 4) Main generation loop
         num_generated = 0
         first_iteration = True
-        while True:
-            # Stop condition: we've reached max tokens
-            if max_tokens is not None and num_generated >= max_tokens:
-                break
-            # Stop condition: all rows are completed
-            if all(state.completed for state in row_states):
-                break
+        try:
+            while True:
+                # Stop condition: we've reached max tokens
+                if max_tokens is not None and num_generated >= max_tokens:
+                    break
+                # Stop condition: all rows are completed
+                if all(state.completed for state in row_states):
+                    break
 
-            # Get sampled tokens - either from prefill or from forward pass
-            if first_iteration:
-                # Use the tokens we already sampled from prefill
-                # sampled_tokens = [sampled_tokens[0]] * num_samples  # Broadcast first token to all rows
-                # # TODO: we should sample a token for each row instead of broadcasting
-                first_iteration = False
-            else:
-                # Forward the model and get the next token for each row
-                ids_attention_mask = torch.cat(
+                # Get sampled tokens - either from prefill or from forward pass
+                if first_iteration:
+                    # Use the tokens we already sampled from prefill
+                    # sampled_tokens = sampled_tokens  # Broadcast first token to all rows
+                    # TODO: we should sample a token for each row instead of broadcasting
+                    first_iteration = False
+                else:
+                    # Forward the model and get the next token for each row
+                    ids_attention_mask = torch.cat(
                         [
                             ids_attention_mask,
                             masks
                         ],
                         dim=1
                     )
-                logits = self.model.forward(ids, attention_mask=ids_attention_mask, kv_cache=kv_cache_decode)  # (B, T, vocab_size)
-                logits = logits[:, -1, :]  # (B, vocab_size) at last time step
-                next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
-                sampled_tokens = next_ids[:, 0].tolist()
+                    logits = self.model.forward(ids, attention_mask=ids_attention_mask, kv_cache=kv_cache_decode)  # (B, T, vocab_size)
+                    logits = logits[:, -1, :]  # (B, vocab_size) at last time step
+                    next_ids = sample_next_token(logits, rng, temperature, top_k, top_p)  # (B, 1)
+                    sampled_tokens = next_ids[:, 0].tolist()
 
-        # Process each row: choose the next token, update state, optional tool use
-            token_column = [] # contains the next token id along each row
-            token_masks = [] # contains the mask (was it sampled (1) or forced (0)?) along each row
-            for i, state in enumerate(row_states):
-                # Select the next token in this row
-                is_forced = len(state.forced_tokens) > 0 # are there tokens waiting to be forced in deque?
-                token_masks.append(0 if is_forced else 1) # mask is 0 if forced, 1 if sampled
-                next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i]
-                token_column.append(next_token)
-                # Update the state of this row to include the next token
-                state.current_tokens.append(next_token)
-                # On <|assistant_end|> or <|bos|>, mark the row as completed
-                if next_token == assistant_end or next_token == bos:
-                    state.completed = True
-                # Handle tool logic
-                if next_token == python_start:
-                    state.in_python_block = True
-                    state.python_expr_tokens = []
-                elif next_token == python_end and state.in_python_block:
-                    state.in_python_block = False
-                    if state.python_expr_tokens:
-                        expr = self.tokenizer.decode(state.python_expr_tokens)
-                        result = use_calculator(expr)
-                        if result is not None:
-                            result_tokens = self.tokenizer.encode(str(result))
-                            state.forced_tokens.append(output_start)
-                            state.forced_tokens.extend(result_tokens)
-                            state.forced_tokens.append(output_end)
-                    state.python_expr_tokens = []
-                elif state.in_python_block:
-                    state.python_expr_tokens.append(next_token)
+                # Process each row: choose the next token, update state, optional tool use
+                token_column = [] # contains the next token id along each row
+                token_masks = [] # contains the mask (was it sampled (1) or forced (0)?) along each row
+                for i, state in enumerate(row_states):
+                    # Select the next token in this row
+                    is_forced = len(state.forced_tokens) > 0 # are there tokens waiting to be forced in deque?
+                    token_masks.append(0 if is_forced else 1) # mask is 0 if forced, 1 if sampled
+                    next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i]
+                    token_column.append(next_token)
+                    # Update the state of this row to include the next token
+                    state.current_tokens.append(next_token)
+                    # On <|assistant_end|> or <|bos|>, mark the row as completed
+                    if next_token == assistant_end or next_token == bos:
+                        
+                        # token_masks[-1] = 0
+                        state.completed = True
+                    # Handle tool logic
+                    if next_token == python_start:
+                        state.in_python_block = True
+                        state.python_expr_tokens = []
+                    elif next_token == python_end and state.in_python_block:
+                        state.in_python_block = False
+                        if state.python_expr_tokens:
+                            expr = self.tokenizer.decode(state.python_expr_tokens)
+                            result = use_calculator(expr)
+                            if result is not None:
+                                result_tokens = self.tokenizer.encode(str(result))
+                                state.forced_tokens.append(output_start)
+                                state.forced_tokens.extend(result_tokens)
+                                state.forced_tokens.append(output_end)
+                        state.python_expr_tokens = []
+                    elif state.in_python_block:
+                        state.python_expr_tokens.append(next_token)
 
-            # Yield the token column
-            yield token_column, token_masks
-            num_generated += 1
-            # Prepare ids for next iteration
-            ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
-            masks = torch.tensor(token_masks, dtype=torch.bool, device=device).unsqueeze(1)
-        
-def generate_batch(self, tokens, num_samples=1, **kwargs):
+                # Yield the token column
+                yield token_column, token_masks
+                num_generated += 1
+                tokens_emitted += len(token_column)
+                # Prepare ids for next iteration
+                ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
+                masks = torch.tensor(token_masks, dtype=torch.bool, device=device).unsqueeze(1)
+        finally:
+            elapsed = time.time() - start_time
+            if log_timing:
+                throughput = tokens_emitted / elapsed if elapsed > 0 else 0.0
+                print(f"[timing] {timing_label}: tokens={tokens_emitted}, time={elapsed:.3f}s, throughput={throughput:.2f} tok/s")
+
+    def generate_batch(self, tokens, num_samples=1, **kwargs):
         """
         Non-streaming batch generation that just returns the final token sequences.
         Returns a list of token sequences (list of lists of ints).
@@ -350,6 +408,196 @@ def generate_batch(self, tokens, num_samples=1, **kwargs):
         return results, masks
 
 
+    @torch.inference_mode()
+    def _generate_speculative(self, tokens, max_tokens, temperature, top_k, top_p, seed, speculative_num_tokens, log_timing=False, timing_label="engine.generate_speculative"):
+        """
+        Speculative decoding with a draft model.
+        Simplified single-sample implementation: draft proposes multiple tokens, target verifies sequentially.
+        """
+        assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
+        device = self.model.get_device()
+        start_time = time.time()
+        tokens_emitted = 0
+        rng_target = torch.Generator(device=device)
+        rng_target.manual_seed(seed)
+        rng_draft = torch.Generator(device=device)
+        rng_draft.manual_seed(seed + 1)
+
+        # Special tokens
+        get_special = lambda s: self.tokenizer.encode_special(s)
+        assistant_end = get_special("<|assistant_end|>")
+        bos = self.tokenizer.get_bos_token_id()
+
+        # Target prefill
+        m_t = self.model.config
+        kv_kwargs_t = {"num_heads": m_t.n_kv_head, "head_dim": m_t.n_embd // m_t.n_head, "num_layers": m_t.n_layer}
+        kv_prefill_t = KVCache(batch_size=1, seq_len=len(tokens), **kv_kwargs_t)
+        ids_full = torch.tensor([tokens], dtype=torch.long, device=device)
+        logits_t = self.model.forward(ids_full, kv_cache=kv_prefill_t)
+        logits_t = logits_t[:, -1, :]
+        kv_decode_t = KVCache(batch_size=1, seq_len=(len(tokens) + (max_tokens or 0)), **kv_kwargs_t)
+        kv_decode_t.prefill(kv_prefill_t)
+        del kv_prefill_t
+        cached_logits_t = logits_t  # logits for first new token
+
+        # Draft prefill
+        m_d = self.draft_model.config
+        kv_kwargs_d = {"num_heads": m_d.n_kv_head, "head_dim": m_d.n_embd // m_d.n_head, "num_layers": m_d.n_layer}
+        kv_prefill_d = KVCache(batch_size=1, seq_len=len(tokens), **kv_kwargs_d)
+        logits_d = self.draft_model.forward(ids_full, kv_cache=kv_prefill_d)
+        logits_d = logits_d[:, -1, :]
+        kv_decode_d = KVCache(batch_size=1, seq_len=(len(tokens) + (max_tokens or 0)), **kv_kwargs_d)
+        kv_decode_d.prefill(kv_prefill_d)
+        del kv_prefill_d
+        cached_logits_d = logits_d  # logits for first new token
+
+        num_generated = 0
+
+        def advance_draft(token_id):
+            nonlocal cached_logits_d
+            ids = torch.tensor([[token_id]], dtype=torch.long, device=device)
+            logits = self.draft_model.forward(ids, kv_cache=kv_decode_d)
+            cached_logits_d = logits[:, -1, :]
+
+        def filter_logits_for_sampling(logits, temperature, top_k, top_p):
+            # Apply temperature
+            logits = logits / max(temperature, 1e-8)
+            # top-k filtering
+            if top_k is not None:
+                k = min(top_k, logits.size(-1))
+                v, _ = torch.topk(logits, k)
+                logits = logits.masked_fill(logits < v[..., [-1]], -float("Inf"))
+            # top-p filtering (copy of apply_top_p_filtering)
+            if top_p is not None and 0.0 < top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                sorted_probs = F.softmax(sorted_logits, dim=-1)
+                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 0] = False
+                indices_to_remove = torch.zeros_like(sorted_indices_to_remove, dtype=torch.bool)
+                indices_to_remove.scatter_(dim=-1, index=sorted_indices, src=sorted_indices_to_remove)
+                logits = logits.masked_fill(indices_to_remove, -float("Inf"))
+            probs = F.softmax(logits, dim=-1)
+            return probs
+
+        try:
+            proposed_tokens_count = 0
+            accepted_tokens_count = 0
+            while True:
+                if max_tokens is not None and num_generated >= max_tokens:
+                    break
+
+                # Snapshot draft position so we can restore after a rejection without cloning full cache
+                kv_decode_d_pos_backup = kv_decode_d.pos
+
+                proposals = []
+                draft_logits_list = []
+                # Draft proposes up to speculative_num_tokens tokens
+                for _ in range(speculative_num_tokens):
+                    logits = cached_logits_d
+                    cached_logits_d = None
+                    draft_logits_list.append(logits)
+                    draft_next = sample_next_token(logits, rng_draft, temperature, top_k, top_p)
+                    draft_token = draft_next[0, 0].item() if draft_next.ndim == 2 else draft_next.item()
+                    proposals.append(draft_token)
+                    proposed_tokens_count += 1
+                    advance_draft(draft_token)
+                    if draft_token == assistant_end or draft_token == bos:
+                        break
+
+                if not proposals:
+                    break
+
+                # Copy target KV cache for speculative check
+                kv_tmp = KVCache(
+                    batch_size=1,
+                    seq_len=kv_decode_t.kv_cache.shape[4],
+                    num_heads=kv_decode_t.kv_shape[3],
+                    head_dim=kv_decode_t.kv_shape[5],
+                    num_layers=kv_decode_t.kv_shape[0],
+                )
+                kv_tmp.prefill(kv_decode_t)
+
+                # Run target over the entire proposal chunk once
+                ids_chunk = torch.tensor([proposals], dtype=torch.long, device=device)
+                logits_chunk = self.model.forward(ids_chunk, kv_cache=kv_tmp)  # (1, L, V)
+
+                accepted_tokens = []
+                rejection_happened = False
+                stop_generation = False
+
+                for idx, token in enumerate(proposals):
+                    # For the first proposal, use the already-computed logits after the prefix.
+                    # For subsequent proposals, use the logits after consuming previous draft tokens.
+                    if idx == 0:
+                        logits_step = cached_logits_t
+                    else:
+                        logits_step = logits_chunk[:, idx - 1, :]
+                    probs_target = filter_logits_for_sampling(logits_step, temperature, top_k, top_p)
+                    draft_logits_step = draft_logits_list[idx]
+                    probs_draft = filter_logits_for_sampling(draft_logits_step, temperature, top_k, top_p)
+
+                    p_t = probs_target[0, token].item()
+                    p_d = probs_draft[0, token].item()
+                    accept_prob = 1.0 if p_d <= 0 else min(1.0, p_t / p_d)
+                    u = torch.rand((), device=device).item()
+
+                    if u <= accept_prob:
+                        # accept proposal
+                        accepted_tokens.append(token)
+                        accepted_tokens_count += 1
+                        print(f"[spec] <accept> p_t={p_t:.4f} p_d={p_d:.4f} u={u:.4f}")
+                        yield [token], [1]
+                        num_generated += 1
+                        tokens_emitted += 1
+                        if token == assistant_end or token == bos:
+                            stop_generation = True
+                            break
+                    else:
+                        # reject: advance target by accepted prefix + sampled target token
+                        target_token = torch.multinomial(probs_target, num_samples=1, generator=rng_target)[0, 0].item()
+                        print(f"[spec] <reject> p_t={p_t:.4f} p_d={p_d:.4f} u={u:.4f}")
+                        seq_to_advance = accepted_tokens + [target_token]
+                        for t in seq_to_advance:
+                            ids = torch.tensor([[t]], dtype=torch.long, device=device)
+                            logits = self.model.forward(ids, kv_cache=kv_decode_t)
+                            cached_logits_t = logits[:, -1, :]
+                        yield [target_token], [1]
+                        num_generated += 1
+                        tokens_emitted += 1
+                        # Reset draft state via position rollback; accepted tokens already in cache, just add target token
+                        kv_decode_d.pos = kv_decode_d_pos_backup + len(accepted_tokens)
+                        advance_draft(target_token)
+                        rejection_happened = True
+                        if target_token == assistant_end or target_token == bos:
+                            stop_generation = True
+                        break
+
+                    if max_tokens is not None and num_generated >= max_tokens:
+                        rejection_happened = True
+                        break
+
+                if rejection_happened:
+                    # If a termination token was emitted on rejection, stop.
+                    if stop_generation or (max_tokens is not None and num_generated >= max_tokens):
+                        break
+                    continue
+
+                # All proposals accepted: commit kv_tmp and continue
+                kv_decode_t = kv_tmp
+                cached_logits_t = logits_chunk[:, -1, :]
+
+                if stop_generation:
+                    break
+
+                if max_tokens is not None and num_generated >= max_tokens:
+                    break
+        finally:
+            elapsed = time.time() - start_time
+            if log_timing:
+                throughput = tokens_emitted / elapsed if elapsed > 0 else 0.0
+                accept_ratio = (accepted_tokens_count / proposed_tokens_count) if proposed_tokens_count > 0 else 0.0
+                print(f"[timing] {timing_label}: tokens={tokens_emitted}, time={elapsed:.3f}s, throughput={throughput:.2f} tok/s, accept_ratio={accept_ratio:.2f}")
 
 
 if __name__ == "__main__":

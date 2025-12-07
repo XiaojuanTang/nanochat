@@ -155,6 +155,67 @@
             align-items: flex-end;
         }
 
+        .settings-wrapper {
+            max-width: 48rem;
+            margin: 0 auto 0.5rem auto;
+            display: none;
+            gap: 0.75rem;
+            align-items: center;
+            font-size: 0.875rem;
+            color: #4b5563;
+        }
+
+        .settings-wrapper.visible {
+            display: flex;
+        }
+
+        .settings-group {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            flex: 1;
+        }
+
+        .settings-toggle-row {
+            max-width: 48rem;
+            margin: 0 auto 0.5rem auto;
+            display: flex;
+            justify-content: flex-end;
+        }
+
+        .settings-toggle-btn {
+            padding: 0.25rem 0.75rem;
+            border-radius: 999px;
+            border: 1px solid #e5e7eb;
+            background-color: #ffffff;
+            color: #4b5563;
+            font-size: 0.75rem;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+        }
+
+        .settings-toggle-btn:hover {
+            background-color: #f3f4f6;
+            border-color: #d1d5db;
+            color: #111827;
+        }
+
+        .settings-label {
+            white-space: nowrap;
+        }
+
+        .temperature-slider {
+            flex: 1;
+        }
+
+        .temperature-value {
+            min-width: 2.5rem;
+            text-align: right;
+        }
+
         .chat-input {
             flex: 1;
             padding: 0.8rem 1rem;
@@ -254,6 +315,52 @@
     </div>
 
     <div class="input-container">
+        <div class="settings-toggle-row">
+            <button id="settingsToggle" class="settings-toggle-btn" type="button" aria-pressed="false">
+                Sampling Config
+            </button>
+        </div>
+        <div id="settingsWrapper" class="settings-wrapper">
+            <div class="settings-group">
+                <label for="temperatureSlider" class="settings-label">Temperature</label>
+                <input
+                    id="temperatureSlider"
+                    class="temperature-slider"
+                    type="range"
+                    min="__MIN_TEMPERATURE__"
+                    max="__MAX_TEMPERATURE__"
+                    step="0.1"
+                    value="__DEFAULT_TEMPERATURE__"
+                />
+                <span id="temperatureValue" class="temperature-value">__DEFAULT_TEMPERATURE__</span>
+            </div>
+            <div class="settings-group">
+                <label for="topkSlider" class="settings-label">Top-k</label>
+                <input
+                    id="topkSlider"
+                    class="temperature-slider"
+                    type="range"
+                    min="__MIN_TOP_K__"
+                    max="__MAX_TOP_K__"
+                    step="1"
+                    value="__DEFAULT_TOP_K__"
+                />
+                <span id="topkValue" class="temperature-value">__DEFAULT_TOP_K__</span>
+            </div>
+            <div class="settings-group">
+                <label for="toppSlider" class="settings-label">Top-p</label>
+                <input
+                    id="toppSlider"
+                    class="temperature-slider"
+                    type="range"
+                    min="__MIN_TOP_P__"
+                    max="__MAX_TOP_P__"
+                    step="0.01"
+                    value="__DEFAULT_TOP_P__"
+                />
+                <span id="toppValue" class="temperature-value">__DEFAULT_TOP_P__</span>
+            </div>
+        </div>
         <div class="input-wrapper">
             <textarea
                 id="chatInput"
@@ -273,21 +380,86 @@
 
     <script>
         const API_URL = '';
+        const MIN_TEMPERATURE = __MIN_TEMPERATURE__;
+        const MAX_TEMPERATURE = __MAX_TEMPERATURE__;
+        const MIN_TOP_K = __MIN_TOP_K__;
+        const MAX_TOP_K = __MAX_TOP_K__;
+        const MIN_TOP_P = __MIN_TOP_P__;
+        const MAX_TOP_P = __MAX_TOP_P__;
         const chatContainer = document.getElementById('chatContainer');
         const chatWrapper = document.getElementById('chatWrapper');
         const chatInput = document.getElementById('chatInput');
         const sendButton = document.getElementById('sendButton');
+        const settingsWrapper = document.getElementById('settingsWrapper');
+        const settingsToggle = document.getElementById('settingsToggle');
+        const temperatureSlider = document.getElementById('temperatureSlider');
+        const temperatureValue = document.getElementById('temperatureValue');
+        const topkSlider = document.getElementById('topkSlider');
+        const topkValue = document.getElementById('topkValue');
+        const toppSlider = document.getElementById('toppSlider');
+        const toppValue = document.getElementById('toppValue');
 
         let messages = [];
         let isGenerating = false;
-        let currentTemperature = 0.8;
-        let currentTopK = 50;
+        let currentTemperature = __DEFAULT_TEMPERATURE__;
+        let currentTopK = __DEFAULT_TOP_K__;
+        let currentTopP = __DEFAULT_TOP_P__;
 
         chatInput.addEventListener('input', function() {
             this.style.height = 'auto';
             this.style.height = Math.min(this.scrollHeight, 200) + 'px';
             sendButton.disabled = !this.value.trim() || isGenerating;
         });
+
+        if (settingsWrapper && settingsToggle) {
+            settingsToggle.addEventListener('click', function() {
+                const nowVisible = settingsWrapper.classList.toggle('visible');
+                settingsToggle.setAttribute('aria-pressed', nowVisible ? 'true' : 'false');
+                settingsToggle.textContent = nowVisible ? 'Hide config' : 'Sampling Config';
+            });
+        }
+
+        if (temperatureSlider && temperatureValue) {
+            const initialTemp = parseFloat(temperatureSlider.value);
+            currentTemperature = isNaN(initialTemp) ? currentTemperature : initialTemp;
+            temperatureValue.textContent = temperatureSlider.value;
+
+            temperatureSlider.addEventListener('input', function() {
+                const value = parseFloat(this.value);
+                if (!isNaN(value)) {
+                    currentTemperature = value;
+                    temperatureValue.textContent = this.value;
+                }
+            });
+        }
+
+        if (topkSlider && topkValue) {
+            const initialTopK = parseInt(topkSlider.value, 10);
+            currentTopK = Number.isNaN(initialTopK) ? currentTopK : initialTopK;
+            topkValue.textContent = topkSlider.value;
+
+            topkSlider.addEventListener('input', function() {
+                const value = parseInt(this.value, 10);
+                if (!Number.isNaN(value)) {
+                    currentTopK = value;
+                    topkValue.textContent = this.value;
+                }
+            });
+        }
+
+        if (toppSlider && toppValue) {
+            const initialTopP = parseFloat(toppSlider.value);
+            currentTopP = Number.isNaN(initialTopP) ? currentTopP : initialTopP;
+            toppValue.textContent = toppSlider.value;
+
+            toppSlider.addEventListener('input', function() {
+                const value = parseFloat(this.value);
+                if (!Number.isNaN(value)) {
+                    currentTopP = value;
+                    toppValue.textContent = this.value;
+                }
+            });
+        }
 
         function handleKeyDown(event) {
             if (event.key === 'Enter' && !event.shiftKey) {
@@ -396,6 +568,7 @@
                         messages: messages,
                         temperature: currentTemperature,
                         top_k: currentTopK,
+                        top_p: currentTopP,
                         max_tokens: 512
                     }),
                 });
@@ -482,10 +655,14 @@
                     addMessage('console', `Current temperature: ${currentTemperature}`);
                 } else {
                     const temp = parseFloat(arg);
-                    if (isNaN(temp) || temp < 0 || temp > 2) {
-                        addMessage('console', 'Invalid temperature. Must be between 0.0 and 2.0');
+                    if (isNaN(temp) || temp < MIN_TEMPERATURE || temp > MAX_TEMPERATURE) {
+                        addMessage('console', `Invalid temperature. Must be between ${MIN_TEMPERATURE} and ${MAX_TEMPERATURE}`);
                     } else {
                         currentTemperature = temp;
+                        if (temperatureSlider && temperatureValue) {
+                            temperatureSlider.value = String(temp);
+                            temperatureValue.textContent = String(temp);
+                        }
                         addMessage('console', `Temperature set to ${currentTemperature}`);
                     }
                 }
@@ -495,11 +672,32 @@
                     addMessage('console', `Current top-k: ${currentTopK}`);
                 } else {
                     const topk = parseInt(arg);
-                    if (isNaN(topk) || topk < 1 || topk > 200) {
-                        addMessage('console', 'Invalid top-k. Must be between 1 and 200');
+                    if (isNaN(topk) || topk < MIN_TOP_K || topk > MAX_TOP_K) {
+                        addMessage('console', `Invalid top-k. Must be between ${MIN_TOP_K} and ${MAX_TOP_K}`);
                     } else {
                         currentTopK = topk;
+                        if (topkSlider && topkValue) {
+                            topkSlider.value = String(topk);
+                            topkValue.textContent = String(topk);
+                        }
                         addMessage('console', `Top-k set to ${currentTopK}`);
+                    }
+                }
+                return true;
+            } else if (cmd === '/topp') {
+                if (arg === undefined) {
+                    addMessage('console', `Current top-p: ${currentTopP}`);
+                } else {
+                    const topp = parseFloat(arg);
+                    if (isNaN(topp) || topp < MIN_TOP_P || topp > MAX_TOP_P) {
+                        addMessage('console', `Invalid top-p. Must be between ${MIN_TOP_P} and ${MAX_TOP_P}`);
+                    } else {
+                        currentTopP = topp;
+                        if (toppSlider && toppValue) {
+                            toppSlider.value = String(topp);
+                            toppValue.textContent = String(topp);
+                        }
+                        addMessage('console', `Top-p set to ${currentTopP}`);
                     }
                 }
                 return true;
@@ -513,6 +711,8 @@
                     '/temperature <value> - Set temperature (0.0-2.0)\n' +
                     '/topk - Show current top-k\n' +
                     '/topk <value> - Set top-k (1-200)\n' +
+                    '/topp - Show current top-p\n' +
+                    '/topp <value> - Set top-p (0.0-1.0)\n' +
                     '/clear - Clear conversation\n' +
                     '/help - Show this help message'
                 );
