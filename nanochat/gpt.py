@@ -77,7 +77,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
 
-    def forward(self, x, cos_sin, kv_cache):
+    def forward(self, x, cos_sin, kv_cache, attn_mask=None, is_causal=True):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -94,29 +94,15 @@ class CausalSelfAttention(nn.Module):
         # Apply KV cache: insert current k,v into cache, get the full view so far
         if kv_cache is not None:
             k, v = kv_cache.insert_kv(self.layer_idx, k, v)
-        Tq = q.size(2) # number of queries in this forward pass
-        Tk = k.size(2) # number of keys/values in total (in the cache + current forward pass)
-
-        # Attention: queries attend to keys/values autoregressively. A few cases to handle:
         enable_gqa = self.n_head != self.n_kv_head # Group Query Attention (GQA): duplicate key/value heads to match query heads if desired
-        if kv_cache is None or Tq == Tk:
-            # During training (no KV cache), attend as usual with causal attention
-            # And even if there is KV cache, we can still use this simple version when Tq == Tk
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
-        elif Tq == 1:
-            # During inference but with a single query in this forward pass:
-            # The query has to attend to all the keys/values in the cache
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
-        else:
-            # During inference AND we have a chunk of queries in this forward pass:
-            # First, each query attends to all the cached keys/values (i.e. full prefix)
-            attn_mask = torch.zeros((Tq, Tk), dtype=torch.bool, device=q.device) # True = keep, False = mask
-            prefix_len = Tk - Tq
-            if prefix_len > 0: # can't be negative but could be zero
-                attn_mask[:, :prefix_len] = True
-            # Then, causal attention within this chunk
-            attn_mask[:, prefix_len:] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
+
+        # Attention: queries attend to keys/values autoregressively.
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            is_causal=is_causal,
+            enable_gqa=enable_gqa,
+        )
 
         # Re-assemble the heads side by side and project back to residual stream
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
@@ -160,8 +146,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, cos_sin, kv_cache):
-        x = x + self.attn(norm(x), cos_sin, kv_cache)
+    def forward(self, x, cos_sin, kv_cache, attn_mask=None, is_causal=True):
+        x = x + self.attn(norm(x), cos_sin, kv_cache, attn_mask, is_causal)
         x = x + self.mlp(norm(x))
         return x
 
@@ -284,16 +270,22 @@ class GPT(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', attention_mask=None):
         B, T = idx.size()
+        # if attention_mask is not None:
+        #     assert attention_mask.size(0) == B, f"attention_mask batch dim {attention_mask.size(0)} != input batch dim {B}"
+        #     attention_mask = attention_mask.to(device=idx.device, dtype=torch.bool)
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
         assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
-        T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
+        
+        
+        prefix_len = 0 if kv_cache is None else kv_cache.get_pos()
+        Tk = prefix_len + T
+        cos_sin = self.cos[:, prefix_len:Tk], self.sin[:, prefix_len:Tk] # truncate cache to current sequence length
 
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx)
@@ -304,20 +296,55 @@ class GPT(nn.Module):
             print0("`use_cache=True` is incompatible with gradient checkpointing. Setting `kv_cache=None`.")
             
         use_ckpt = config_ckpt and kv_cache is None
+
+        # Precompute attention mask once at the GPT level
+        def build_attn_mask(attn_mask, Tq, Tk, prefix_len):
+            base = torch.tril(
+                torch.ones((Tq, Tk), dtype=torch.bool, device=x.device),
+                diagonal=prefix_len,
+            ).unsqueeze(0).unsqueeze(0) # (1, 1, Tq, Tk)
+            if attn_mask is None:
+                return base
+            mask = attn_mask
+            # if mask.size(1) == Tq and prefix_len > 0:
+            #     pad_prefix = torch.ones((B, prefix_len), dtype=mask.dtype, device=mask.device)
+            #     mask = torch.cat((pad_prefix, mask), dim=1)
+            # assert mask.size(1) == Tk, f"attention_mask must have shape (B, {Tk}) or (B, {Tq})"
+            # mask = mask.to(device=base.device, dtype=torch.bool)
+            key_mask = mask[:, None, None, :] # (B, 1, 1, Tk)
+            # query_mask = mask[:, None, prefix_len:prefix_len+Tq, None] # (B, 1, Tq, 1)
+            return base & key_mask 
+
+        
+        
+        attn_mask = None
+        is_causal = True
+        
+        if attention_mask is not None or kv_cache is not None:
+            attn_mask = build_attn_mask(attention_mask, T, Tk, prefix_len)
+            is_causal = False
+        
         
         for block in self.transformer.h:
             if use_ckpt:
                 def checkpointed_block(hidden, block=block):
-                    return block(hidden, cos_sin, None) # kv_cache is None inside checkpointed block
+                    return block(hidden, cos_sin, None, attn_mask, is_causal) # kv_cache is None inside checkpointed block
                 x = cp.checkpoint(checkpointed_block, x, use_reentrant=False)
             else:
-                x = block(x, cos_sin, kv_cache)
+                x = block(x, cos_sin, kv_cache, attn_mask, is_causal)
         x = norm(x)
 
         # Forward the lm_head (compute logits)
         softcap = 15
         
         if targets is not None:
+            if attention_mask is not None:
+                if attention_mask.size(1) != targets.size(1):
+                    assert attention_mask.size(1) >= targets.size(1), f"attention_mask time dim {attention_mask.size(1)} smaller than targets {targets.size(1)}"
+                    mask_for_loss = attention_mask[:, -targets.size(1):]
+                else:
+                    mask_for_loss = attention_mask
+                targets = targets.masked_fill(mask_for_loss == 0, -1)
             # training mode: compute and return the loss
             # TODO: experiment with Liger Kernels / chunked cross-entropy etc.
             if self.use_liger_ce:

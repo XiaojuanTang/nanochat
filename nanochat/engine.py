@@ -191,9 +191,12 @@ class Engine:
         self.tokenizer = tokenizer # needed for tool use
 
     @torch.inference_mode()
-    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
+    def generate(self, tokens,  attention_mask=None, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
         """Same as generate, but does single prefill and then clones the KV cache."""
-        assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
+        # assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
+        # process one squence 
+        if isinstance(tokens[0], int):
+            tokens = [tokens]
         device = self.model.get_device()
         rng = torch.Generator(device=device)
         rng.manual_seed(seed)
@@ -211,28 +214,33 @@ class Engine:
         m = self.model.config
         kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
         kv_cache_prefill = KVCache(
-            batch_size=1,
-            seq_len=len(tokens),
+            batch_size=len(tokens),
+            seq_len=len(tokens[0]),
             **kv_model_kwargs,
         )
-        ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
+        ids = torch.tensor(tokens, dtype=torch.long, device=device)
+        if not attention_mask is None:
+            ids_attention_mask = torch.tensor(attention_mask, dtype=torch.bool, device=device)
+        else:
+            ids_attention_mask = None
+        logits = self.model.forward(ids, attention_mask=ids_attention_mask, kv_cache=kv_cache_prefill)
         logits = logits[:, -1, :]
         next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
         sampled_tokens = next_ids[:, 0].tolist()
 
         # 2) Replicate the KV cache for each sample/row
-        kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
+        kv_length_hint = (len(tokens[0]) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
         kv_cache_decode = KVCache(
-            batch_size=num_samples,
+            batch_size=len(tokens),
             seq_len=kv_length_hint,
             **kv_model_kwargs,
         )
         kv_cache_decode.prefill(kv_cache_prefill)
+        
         del kv_cache_prefill # no need to keep this memory around
 
         # 3) Initialize states for each sample
-        row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
+        row_states = [RowState(token.copy()) for token in tokens]
 
         # 4) Main generation loop
         num_generated = 0
@@ -248,17 +256,24 @@ class Engine:
             # Get sampled tokens - either from prefill or from forward pass
             if first_iteration:
                 # Use the tokens we already sampled from prefill
-                sampled_tokens = [sampled_tokens[0]] * num_samples  # Broadcast first token to all rows
-                # TODO: we should sample a token for each row instead of broadcasting
+                # sampled_tokens = [sampled_tokens[0]] * num_samples  # Broadcast first token to all rows
+                # # TODO: we should sample a token for each row instead of broadcasting
                 first_iteration = False
             else:
                 # Forward the model and get the next token for each row
-                logits = self.model.forward(ids, kv_cache=kv_cache_decode)  # (B, T, vocab_size)
+                ids_attention_mask = torch.cat(
+                        [
+                            ids_attention_mask,
+                            masks
+                        ],
+                        dim=1
+                    )
+                logits = self.model.forward(ids, attention_mask=ids_attention_mask, kv_cache=kv_cache_decode)  # (B, T, vocab_size)
                 logits = logits[:, -1, :]  # (B, vocab_size) at last time step
                 next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
                 sampled_tokens = next_ids[:, 0].tolist()
 
-            # Process each row: choose the next token, update state, optional tool use
+        # Process each row: choose the next token, update state, optional tool use
             token_column = [] # contains the next token id along each row
             token_masks = [] # contains the mask (was it sampled (1) or forced (0)?) along each row
             for i, state in enumerate(row_states):
@@ -295,8 +310,9 @@ class Engine:
             num_generated += 1
             # Prepare ids for next iteration
             ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
-
-    def generate_batch(self, tokens, num_samples=1, **kwargs):
+            masks = torch.tensor(token_masks, dtype=torch.bool, device=device).unsqueeze(1)
+        
+def generate_batch(self, tokens, num_samples=1, **kwargs):
         """
         Non-streaming batch generation that just returns the final token sequences.
         Returns a list of token sequences (list of lists of ints).
@@ -304,10 +320,23 @@ class Engine:
         """
         assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
         bos = self.tokenizer.get_bos_token_id()
-        results = [tokens.copy() for _ in range(num_samples)]
-        masks = [[0] * len(tokens) for _ in range(num_samples)]
+        max_tokens_len = max([len(token) for token in tokens])
+        results = [token.copy() for token in tokens]
+       
         completed = [False] * num_samples
-        for token_column, token_masks in self.generate(tokens, num_samples, **kwargs):
+        
+        # need padding to make all input token lists the same length
+        padded_tokens = []
+        masks = []
+        for token in tokens:
+            padded = [bos] * (max_tokens_len - len(token)) + token
+            masks.append([0] * (max_tokens_len - len(token)) + [1] * len(token))
+            padded_tokens.append(padded)
+        # inputs_ids = {
+        #     "input_ids": padded_tokens,
+        #     "attention_mask": masks,
+        # }
+        for token_column, token_masks in self.generate(padded_tokens, attention_mask=masks, num_samples=num_samples, **kwargs):
             for i, (token, mask) in enumerate(zip(token_column, token_masks)):
                 if not completed[i]:
                     if token == assistant_end or token == bos:
@@ -319,6 +348,8 @@ class Engine:
             if all(completed):
                 break
         return results, masks
+
+
 
 
 if __name__ == "__main__":

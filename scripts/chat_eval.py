@@ -27,43 +27,68 @@ from tasks.spellingbee import SpellingBee
 from tasks.aime_24_25 import AIME_24, AIME_25
 
 # -----------------------------------------------------------------------------
-# Generative evaluation loop (we go one problem at a time, sample, evaluate)
+# Generative evaluation loop (sample and evaluate). Supports processing multiple
+# problems per iteration to reduce Python overhead.
 
-def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=None):
+def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=None, batch_size=1):
 
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     device = model.get_device()
 
     num_problems = len(task_object) if max_problems is None else min(len(task_object), max_problems)
+    # Distribute indices across ranks and chunk them for batched processing
+    rank_indices = list(range(ddp_rank, num_problems, ddp_world_size))
+    batch_size = max(1, batch_size)
 
     # Run the evaluation
     num_passed, total = 0, 0
-    for i in range(ddp_rank, num_problems, ddp_world_size):
-        conversation = task_object[i]
+    for i in range(0, len(rank_indices), batch_size):
+        batch_indices = rank_indices[i:i + batch_size]
+        conversations = [task_object[idx] for idx in batch_indices]
+        encoded_prompts = [tokenizer.render_for_completion(conv) for conv in conversations]
 
-        # Tokenize the prompt
-        encoded_prompt = tokenizer.render_for_completion(conversation)
-        # Get the completions
-        results, _ = engine.generate_batch(
-            encoded_prompt,
-            num_samples=num_samples,
-            max_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-        )
-        # Decode the completions as text
-        prefix_length = len(encoded_prompt)
-        completions = [tokenizer.decode(result_tokens[prefix_length:]) for result_tokens in results]
-        # Evaluate success criteria
-        outcomes = [task_object.evaluate(conversation, completion) for completion in completions]
+        batch_results, _ = engine.generate_batch(
+                encoded_prompts,
+                num_samples=batch_size,
+                max_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+            )
+        raw_tokens = [res[len(encoded_prompt):] for res, encoded_prompt in zip(batch_results, encoded_prompts)] 
+        completions = [tokenizer.decode(tokens) for tokens in raw_tokens]
+        # completions = tokenizer.batch_decode(raw_tokens, skip_special_tokens=True)
+        
+        outcomes = [task_object.evaluate(conversation, completion) for conversation, completion in zip(conversations, completions)]
         passed = any(outcomes)
-
-        # Keep stats
-        total += 1
+        
+        total += len(conversations)
         num_passed += int(passed)
-
-        # Logging (overwrite the same line in the console)
         print(f"\r\033[KRank {ddp_rank} | {num_passed}/{total} ({100*num_passed/total:.2f}%)", end='', flush=True)
+        
+        
+       
+        # for conversation, encoded_prompt in zip(conversations, encoded_prompts):
+        #     # Get the completions
+        #     results, _ = engine.generate_batch(
+        #         encoded_prompt,
+        #         num_samples=num_samples,
+        #         max_tokens=max_new_tokens,
+        #         temperature=temperature,
+        #         top_k=top_k,
+        #     )
+        #     # Decode the completions as text
+        #     prefix_length = len(encoded_prompt)
+        #     completions = [tokenizer.decode(result_tokens[prefix_length:]) for result_tokens in results]
+        #     # Evaluate success criteria
+        #     outcomes = [task_object.evaluate(conversation, completion) for completion in completions]
+        #     passed = any(outcomes)
+
+        #     # Keep stats
+        #     total += 1
+        #     num_passed += int(passed)
+
+        #     # Logging (overwrite the same line in the console)
+        #     print(f"\r\033[KRank {ddp_rank} | {num_passed}/{total} ({100*num_passed/total:.2f}%)", end='', flush=True)
 
     # Finish the in-place progress line with a newline before final summary
     print()
@@ -158,7 +183,7 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
 # -----------------------------------------------------------------------------
 
 def run_chat_eval(task_name, model, tokenizer, engine,
-                   batch_size=1, num_samples=1, max_new_tokens=512, temperature=0.0, top_k=50,
+                   batch_size=1, gen_batch_size=1, num_samples=1, max_new_tokens=512, temperature=0.0, top_k=50,
                    max_problems=None):
     # Create the evaluation object
     task_module = {
@@ -174,7 +199,7 @@ def run_chat_eval(task_name, model, tokenizer, engine,
     task_object = task_module()
     # Run the evaluation
     if task_object.eval_type == 'generative':
-        acc = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems)
+        acc = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems, batch_size=gen_batch_size)
     elif task_object.eval_type == 'categorical':
         acc = run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=max_problems)
     else:
@@ -193,7 +218,8 @@ if __name__ == "__main__":
     parser.add_argument('-m', '--max-new-tokens', type=int, default=512)
     parser.add_argument('-n', '--num-samples', type=int, default=1)
     parser.add_argument('-k', '--top-k', type=int, default=50)
-    parser.add_argument('-b', '--batch-size', type=int, default=8, help='Batch size for categorical evaluation')
+    parser.add_argument('-b', '--batch-size', type=int, default=1, help='Batch size for categorical evaluation')
+    parser.add_argument('--gen-batch-size', type=int, default=1, help='Batch size for generative evaluation (problems per rank)')
     parser.add_argument('-g', '--model-tag', type=str, default=None, help='Model tag to load')
     parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
     parser.add_argument('-x', '--max-problems', type=int, default=None, help='Max problems to evaluate')
@@ -230,6 +256,7 @@ if __name__ == "__main__":
                 task_name,
                 model, tokenizer, engine,
                 batch_size=args.batch_size,
+                gen_batch_size=args.gen_batch_size,
                 num_samples=args.num_samples,
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
